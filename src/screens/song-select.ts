@@ -5,6 +5,7 @@ import type { Screen } from './screen-manager.ts';
 import {
   getAllBeatmapSets,
   saveBeatmapSet,
+  getScores,
   type StoredBeatmapSet,
 } from '../storage/beatmap-db.ts';
 import { loadOsz } from '../core/osz-loader.ts';
@@ -270,10 +271,10 @@ export class SongSelectScreen implements Screen {
 
   private async loadBeatmaps(): Promise<void> {
     this.beatmapSets = await getAllBeatmapSets();
-    this.renderList();
+    await this.renderList();
   }
 
-  private renderList(): void {
+  private async renderList(): Promise<void> {
     this.listContainer.removeChildren();
     this.cards = [];
 
@@ -298,7 +299,21 @@ export class SongSelectScreen implements Screen {
     let y = 8; // top padding
     for (const set of this.beatmapSets) {
       for (let dIdx = 0; dIdx < set.difficulties.length; dIdx++) {
-        const card = this.createBeatmapCard(set, dIdx, y);
+        const diff = set.difficulties[dIdx];
+        // Fetch best score for this difficulty
+        let bestScore: { score: number; rank: string; accuracy: number } | null = null;
+        if (set.id != null) {
+          const scores = await getScores(set.id, diff.metadata.version);
+          if (scores.length > 0) {
+            bestScore = {
+              score: scores[0].score,
+              rank: scores[0].rank,
+              accuracy: scores[0].accuracy,
+            };
+          }
+        }
+
+        const card = this.createBeatmapCard(set, dIdx, y, bestScore);
         this.listContainer.addChild(card);
         this.cards.push({ set, diffIdx: dIdx, y });
         y += CARD_HEIGHT + CARD_GAP;
@@ -311,7 +326,8 @@ export class SongSelectScreen implements Screen {
   private createBeatmapCard(
     set: StoredBeatmapSet,
     diffIdx: number,
-    y: number
+    y: number,
+    bestScore: { score: number; rank: string; accuracy: number } | null
   ): Container {
     const diff = set.difficulties[diffIdx];
     const card = new Container();
@@ -334,8 +350,10 @@ export class SongSelectScreen implements Screen {
       },
     });
     titleText.position.set(12, 8);
-    if (titleText.width > cardWidth - 24) {
-      titleText.width = cardWidth - 24;
+    // Leave room for rank badge on the right
+    const maxTitleWidth = cardWidth - (bestScore ? 80 : 24);
+    if (titleText.width > maxTitleWidth) {
+      titleText.width = maxTitleWidth;
     }
     card.addChild(titleText);
 
@@ -361,6 +379,51 @@ export class SongSelectScreen implements Screen {
     });
     statsText.position.set(12, 52);
     card.addChild(statsText);
+
+    // Best score display on the right side of the card
+    if (bestScore) {
+      const RANK_COLORS: Record<string, number> = {
+        SS: 0xffdd00, S: 0xffdd00, A: 0x66ff66,
+        B: 0x66aaff, C: 0xaa66ff, D: 0xff4444,
+      };
+
+      const rankText = new Text({
+        text: bestScore.rank,
+        style: {
+          fontSize: 28,
+          fontFamily: 'Arial',
+          fontWeight: 'bold',
+          fill: RANK_COLORS[bestScore.rank] ?? 0xffffff,
+        },
+      });
+      rankText.anchor.set(1, 0);
+      rankText.position.set(cardWidth - 12, 6);
+      card.addChild(rankText);
+
+      const scoreText = new Text({
+        text: `${(bestScore.accuracy * 100).toFixed(1)}%`,
+        style: {
+          fontSize: 12,
+          fontFamily: 'Arial',
+          fill: 0xaaaaaa,
+        },
+      });
+      scoreText.anchor.set(1, 0);
+      scoreText.position.set(cardWidth - 12, 38);
+      card.addChild(scoreText);
+
+      const scoreNum = new Text({
+        text: bestScore.score.toLocaleString(),
+        style: {
+          fontSize: 11,
+          fontFamily: 'Arial',
+          fill: 0x888888,
+        },
+      });
+      scoreNum.anchor.set(1, 0);
+      scoreNum.position.set(cardWidth - 12, 54);
+      card.addChild(scoreNum);
+    }
 
     return card;
   }
