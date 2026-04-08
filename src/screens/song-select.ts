@@ -6,6 +6,7 @@ import {
   getAllBeatmapSets,
   saveBeatmapSet,
   getScores,
+  deleteBeatmapSet,
   type StoredBeatmapSet,
 } from '../storage/beatmap-db.ts';
 import { loadOsz } from '../core/osz-loader.ts';
@@ -16,7 +17,7 @@ type ScreenNavigator = (name: string) => void;
 
 const HEADER_HEIGHT = 60;
 const FOOTER_HEIGHT = 70;
-const CARD_HEIGHT = 72;
+const CARD_HEIGHT = 60;
 const CARD_GAP = 8;
 const TAP_THRESHOLD = 12; // px movement to distinguish tap from drag
 
@@ -24,6 +25,13 @@ interface CardEntry {
   set: StoredBeatmapSet;
   diffIdx: number;
   y: number; // position in list space
+}
+
+interface DeleteZone {
+  setId: number;
+  y: number;
+  height: number;
+  xStart: number; // only trigger delete if tap is in the right portion
 }
 
 export class SongSelectScreen implements Screen {
@@ -37,6 +45,7 @@ export class SongSelectScreen implements Screen {
   private loadingText: Text | null = null;
   private totalListHeight = 0;
   private cards: CardEntry[] = [];
+  private deleteZones: DeleteZone[] = [];
 
   constructor(navigate: ScreenNavigator) {
     this.navigate = navigate;
@@ -105,14 +114,13 @@ export class SongSelectScreen implements Screen {
       this.listContainer.position.y = HEADER_HEIGHT + this.scrollY;
     });
 
-    const endDrag = (e: { globalY: number }) => {
+    const endDrag = (e: { globalX: number; globalY: number }) => {
       if (!isDragging) return;
       isDragging = false;
 
       // If it was a tap (not a drag), find which card was tapped
       if (!wasDrag) {
-        const tapY = e.globalY;
-        this.handleTap(tapY);
+        this.handleTap(e.globalX, e.globalY);
       }
     };
     touchOverlay.on('pointerup', endDrag);
@@ -216,16 +224,89 @@ export class SongSelectScreen implements Screen {
     this.autoLoadTestBeatmap();
   }
 
-  private handleTap(screenY: number): void {
+  private handleTap(screenX: number, screenY: number): void {
     // Convert screen Y to list-space Y
     const listY = screenY - HEADER_HEIGHT - this.scrollY;
 
+    // Check delete zones first (only if tap is on the right side)
+    for (const zone of this.deleteZones) {
+      if (
+        listY >= zone.y &&
+        listY < zone.y + zone.height &&
+        screenX >= zone.xStart
+      ) {
+        this.confirmDelete(zone.setId);
+        return;
+      }
+    }
+
+    // Check card taps
     for (const card of this.cards) {
       if (listY >= card.y && listY < card.y + CARD_HEIGHT) {
         this.playBeatmap(card.set, card.diffIdx);
         return;
       }
     }
+  }
+
+  private confirmDelete(setId: number): void {
+    // Show confirmation overlay
+    const overlay = new Container();
+    overlay.zIndex = 50;
+
+    const w = this.app.screen.width;
+    const h = this.app.screen.height;
+
+    const dimBg = new Graphics();
+    dimBg.rect(0, 0, w, h);
+    dimBg.fill({ color: 0x000000, alpha: 0.7 });
+    dimBg.eventMode = 'static'; // block events below
+    overlay.addChild(dimBg);
+
+    const msg = new Text({
+      text: 'Delete this beatmap set?',
+      style: {
+        fontSize: 20,
+        fontFamily: 'Arial',
+        fontWeight: 'bold',
+        fill: 0xffffff,
+      },
+    });
+    msg.anchor.set(0.5);
+    msg.position.set(w / 2, h / 2 - 40);
+    overlay.addChild(msg);
+
+    const makeBtn = (label: string, x: number, color: number, cb: () => void) => {
+      const btn = new Graphics();
+      btn.roundRect(x - 55, h / 2, 110, 40, 8);
+      btn.fill({ color });
+      btn.eventMode = 'static';
+      btn.cursor = 'pointer';
+      btn.on('pointerdown', cb);
+      overlay.addChild(btn);
+
+      const txt = new Text({
+        text: label,
+        style: { fontSize: 16, fontFamily: 'Arial', fontWeight: 'bold', fill: 0xffffff },
+      });
+      txt.anchor.set(0.5);
+      txt.position.set(x, h / 2 + 20);
+      overlay.addChild(txt);
+    };
+
+    makeBtn('Delete', w / 2 - 70, 0xcc3333, async () => {
+      this.container.removeChild(overlay);
+      overlay.destroy({ children: true });
+      await deleteBeatmapSet(setId);
+      await this.loadBeatmaps();
+    });
+
+    makeBtn('Cancel', w / 2 + 70, 0x555577, () => {
+      this.container.removeChild(overlay);
+      overlay.destroy({ children: true });
+    });
+
+    this.container.addChild(overlay);
   }
 
   private async autoLoadTestBeatmap(): Promise<void> {
@@ -277,6 +358,7 @@ export class SongSelectScreen implements Screen {
   private async renderList(): Promise<void> {
     this.listContainer.removeChildren();
     this.cards = [];
+    this.deleteZones = [];
 
     if (this.beatmapSets.length === 0) {
       const viewHeight = this.app.screen.height - HEADER_HEIGHT - FOOTER_HEIGHT;
@@ -296,11 +378,61 @@ export class SongSelectScreen implements Screen {
       return;
     }
 
+    const w = this.app.screen.width;
     let y = 8; // top padding
+
     for (const set of this.beatmapSets) {
+      // Set header with song name and delete button
+      const headerHeight = 32;
+      const header = new Container();
+      header.position.set(0, y);
+
+      const firstDiff = set.difficulties[0];
+      const headerText = new Text({
+        text: `${firstDiff.metadata.artist} - ${firstDiff.metadata.title}`,
+        style: {
+          fontSize: 13,
+          fontFamily: 'Arial',
+          fontWeight: 'bold',
+          fill: 0x999999,
+        },
+      });
+      headerText.position.set(14, 8);
+      if (headerText.width > w - 80) {
+        headerText.width = w - 80;
+      }
+      header.addChild(headerText);
+
+      // Delete "×" button
+      const deleteBtn = new Text({
+        text: '×',
+        style: {
+          fontSize: 22,
+          fontFamily: 'Arial',
+          fontWeight: 'bold',
+          fill: 0x664444,
+        },
+      });
+      deleteBtn.anchor.set(1, 0);
+      deleteBtn.position.set(w - 14, 4);
+      header.addChild(deleteBtn);
+
+      this.listContainer.addChild(header);
+
+      // Track delete zone (right 50px of the header)
+      if (set.id != null) {
+        this.deleteZones.push({
+          setId: set.id,
+          y,
+          height: headerHeight,
+          xStart: w - 50,
+        });
+      }
+
+      y += headerHeight;
+
       for (let dIdx = 0; dIdx < set.difficulties.length; dIdx++) {
         const diff = set.difficulties[dIdx];
-        // Fetch best score for this difficulty
         let bestScore: { score: number; rank: string; accuracy: number } | null = null;
         if (set.id != null) {
           const scores = await getScores(set.id, diff.metadata.version);
@@ -318,7 +450,7 @@ export class SongSelectScreen implements Screen {
         this.cards.push({ set, diffIdx: dIdx, y });
         y += CARD_HEIGHT + CARD_GAP;
       }
-      y += 4; // extra gap between sets
+      y += 8; // gap between sets
     }
     this.totalListHeight = y;
   }
@@ -341,24 +473,8 @@ export class SongSelectScreen implements Screen {
     cardBg.fill({ color: 0x2a2a4e });
     card.addChild(cardBg);
 
-    const titleText = new Text({
-      text: `${diff.metadata.artist} - ${diff.metadata.title}`,
-      style: {
-        fontSize: 14,
-        fontFamily: 'Arial',
-        fill: 0xcccccc,
-      },
-    });
-    titleText.position.set(12, 8);
-    // Leave room for rank badge on the right
-    const maxTitleWidth = cardWidth - (bestScore ? 80 : 24);
-    if (titleText.width > maxTitleWidth) {
-      titleText.width = maxTitleWidth;
-    }
-    card.addChild(titleText);
-
     const versionText = new Text({
-      text: `[${diff.metadata.version}]`,
+      text: diff.metadata.version,
       style: {
         fontSize: 18,
         fontFamily: 'Arial',
@@ -366,18 +482,18 @@ export class SongSelectScreen implements Screen {
         fill: 0xff66aa,
       },
     });
-    versionText.position.set(12, 28);
+    versionText.position.set(12, 10);
     card.addChild(versionText);
 
     const statsText = new Text({
       text: `CS:${diff.difficulty.cs}  AR:${diff.difficulty.ar}  OD:${diff.difficulty.od}  HP:${diff.difficulty.hp}  |  ${diff.hitObjects.length} obj`,
       style: {
-        fontSize: 11,
+        fontSize: 12,
         fontFamily: 'Arial',
         fill: 0x888888,
       },
     });
-    statsText.position.set(12, 52);
+    statsText.position.set(12, 38);
     card.addChild(statsText);
 
     // Best score display on the right side of the card
@@ -396,8 +512,8 @@ export class SongSelectScreen implements Screen {
           fill: RANK_COLORS[bestScore.rank] ?? 0xffffff,
         },
       });
-      rankText.anchor.set(1, 0);
-      rankText.position.set(cardWidth - 12, 6);
+      rankText.anchor.set(1, 0.5);
+      rankText.position.set(cardWidth - 12, CARD_HEIGHT / 2 - 8);
       card.addChild(rankText);
 
       const scoreText = new Text({
@@ -409,20 +525,8 @@ export class SongSelectScreen implements Screen {
         },
       });
       scoreText.anchor.set(1, 0);
-      scoreText.position.set(cardWidth - 12, 38);
+      scoreText.position.set(cardWidth - 12, CARD_HEIGHT / 2 + 10);
       card.addChild(scoreText);
-
-      const scoreNum = new Text({
-        text: bestScore.score.toLocaleString(),
-        style: {
-          fontSize: 11,
-          fontFamily: 'Arial',
-          fill: 0x888888,
-        },
-      });
-      scoreNum.anchor.set(1, 0);
-      scoreNum.position.set(cardWidth - 12, 54);
-      card.addChild(scoreNum);
     }
 
     return card;
